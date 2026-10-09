@@ -33,7 +33,27 @@
     color: #52525b; font-size: 12px;
   }
   #screen_container canvas { width: 100%; height: 100%; display: block; image-rendering: pixelated; }
+  #screen_container { touch-action: none; } /* let v86 own touches, no page scroll/zoom fight */
   .foot { margin-top: 14px; color: #52525b; font-size: 11px; }
+  /* ---- mobile keyboard bar ---- */
+  #kbdbar { display: none; width: min(960px, 100%); margin-top: 10px; }
+  body.mobile.running #kbdbar { display: block; }
+  #kbdbar .row { display: flex; gap: 8px; margin-bottom: 8px; }
+  #kbd-input {
+    flex: 1; min-width: 0; background: #18181b; border: 1px solid #3f3f46; color: #e8e8ea;
+    font: inherit; font-size: 16px; padding: 12px; border-radius: 6px;
+  }
+  #kbd-input:focus { outline: none; border-color: #a1a1aa; }
+  button.key {
+    background: #18181b; border: 1px solid #3f3f46; color: #e8e8ea;
+    font: inherit; font-size: 15px; padding: 12px 13px; border-radius: 6px; cursor: pointer;
+    touch-action: manipulation; user-select: none; -webkit-user-select: none;
+  }
+  button.key:active { background: #27272a; }
+  @media (pointer: coarse) {
+    button.distro { padding: 14px 20px; font-size: 15px; }
+    body { padding-bottom: max(28px, env(safe-area-inset-bottom)); }
+  }
 </style>
 </head>
 <body>
@@ -43,6 +63,22 @@
   <div id="status">pick a distro</div>
   <div id="barwrap"><div id="bar"></div></div>
   <div id="screen"><div id="screen_container"><span>no machine running</span></div></div>
+  <div id="kbdbar">
+    <div class="row">
+      <input id="kbd-input" type="text" autocomplete="off" autocorrect="off" autocapitalize="off"
+             spellcheck="false" enterkeyhint="enter" placeholder="type into the machine…">
+    </div>
+    <div class="row">
+      <button class="key" data-k="enter">&#9166;</button>
+      <button class="key" data-k="tab">&#8677;</button>
+      <button class="key" data-k="esc">esc</button>
+      <button class="key" data-k="up">&uarr;</button>
+      <button class="key" data-k="down">&darr;</button>
+      <button class="key" data-k="left">&larr;</button>
+      <button class="key" data-k="right">&rarr;</button>
+      <button class="key" data-k="ctrlc">^C</button>
+    </div>
+  </div>
   <div class="foot">RAM only &middot; no disk writes &middot; no guest network</div>
 
 <script src="vendor/libv86.js"></script>
@@ -55,17 +91,24 @@
 // Same-origin copies under ./isos/ are the working path (see ?local=1).
 // NOTE: v86 is a 32-bit (i686) emulator — all ISOs below MUST be 32-bit.
 // x86_64 images will not boot, period.
+// Mobile: coarse pointer + phone-sized screen. Mobile mode = light distros only,
+// RAM capped at 256MB (mobile browsers kill memory-hungry tabs), virtual keyboard.
+const MOBILE = window.matchMedia("(pointer: coarse)").matches &&
+               Math.min(window.screen.width, window.screen.height) < 820;
+if (MOBILE) document.body.classList.add("mobile");
+const MOBILE_RAM_MB = 256;
+
 const DISTROS = [
-  { id: "dsl", name: "DSL", size: "50 MB", ram: 512,
+  { id: "dsl", name: "DSL", size: "50 MB", ram: 512, mobile: false, // desktop too slow on phones
     url: "https://archive.org/download/damn-small-linux-4.4.10/dsl-4.4.10.iso",
     file: "dsl-4.4.10.iso" },
-  { id: "tinycore", name: "Tiny Core", size: "25 MB", ram: 512,
+  { id: "tinycore", name: "Tiny Core", size: "25 MB", ram: 512, mobile: false, // kernel-panics under v86
     url: "https://archive.org/download/tiny-core-current_202412/TinyCore-current.iso",
     file: "TinyCore-current.iso" },
-  { id: "alpine", name: "Alpine", size: "222 MB", ram: 1024,
+  { id: "alpine", name: "Alpine", size: "222 MB", ram: 1024, mobile: true, // console-first, phone-sized RAM
     url: "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/x86/alpine-standard-3.22.1-x86.iso",
     file: "alpine-standard-3.22.1-x86.iso" },
-  { id: "slax", name: "Slax", size: "226 MB", ram: 1024,
+  { id: "slax", name: "Slax", size: "226 MB", ram: 1024, mobile: false,
     url: "https://archive.org/download/20260924_20260924_1127/slax-English-US-7.0.8-i486.iso",
     file: "slax-English-US-7.0.8-i486.iso" },
 ];
@@ -82,13 +125,15 @@ function setStatus(t) { statusEl.textContent = t; }
 function setBar(p) { barEl.style.width = Math.round(p * 100) + "%"; }
 
 for (const d of DISTROS) {
+  if (MOBILE && !d.mobile) continue; // phones get the light list only
   const b = document.createElement("button");
   b.className = "distro";
-  b.innerHTML = d.name + "<small>" + d.size + "</small>";
+  b.innerHTML = d.name + "<small>" + d.size + (MOBILE ? " · " + MOBILE_RAM_MB + "MB" : "") + "</small>";
   b.onclick = () => boot(d);
   b.dataset.id = d.id;
   pickerEl.appendChild(b);
 }
+if (MOBILE) setStatus("mobile mode · light distros · " + MOBILE_RAM_MB + "MB RAM");
 function lockPicker(lock) {
   pickerEl.querySelectorAll("button").forEach(b => b.disabled = lock);
 }
@@ -135,10 +180,11 @@ async function boot(d) {
     setStatus("starting emulator…");
     setBar(1);
     screenEl.innerHTML = "";
+    const ramMB = MOBILE ? Math.min(d.ram, MOBILE_RAM_MB) : d.ram;
     // NOTE: current v86 builds export `V86` (V86Starter was renamed)
     const emulator = new V86({
       wasm_path: "vendor/v86.wasm",
-      memory_size: d.ram * 1024 * 1024,
+      memory_size: ramMB * 1024 * 1024,
       vga_memory_size: 8 * 1024 * 1024,
       screen_container: screenEl,
       bios: { url: "bios/seabios.bin" },
@@ -147,13 +193,58 @@ async function boot(d) {
       autostart: true,
     });
     emulator.add_listener("emulator-ready", () => {
-      setStatus(d.name + " running — close the tab to kill it");
+      setStatus(d.name + " running" + (MOBILE ? " · " + ramMB + "MB" : "") + " — close the tab to kill it");
     });
+    document.body.classList.add("running");
     window._emulator = emulator; // debug handle
+    wireKeyboard(emulator);
   } catch (e) {
     setStatus("boot failed: " + (e && e.message || e));
     lockPicker(false);
   }
+}
+
+// ---- virtual keyboard (mobile) ----
+// Text field: live-diffed into the guest via keyboard_send_text (v86 maps
+// chars to scancodes internally). Special keys go as raw PS/2 set-1 scancodes.
+function wireKeyboard(emulator) {
+  const input = document.getElementById("kbd-input");
+  let lastVal = "";
+  const sendCodes = (bytes) => { try { emulator.keyboard_send_scancodes(bytes); } catch (e) {} };
+  const tapKey = (make) => {
+    const brk = make.map(b => b === 0xE0 ? 0xE0 : b | 0x80);
+    sendCodes(make);
+    setTimeout(() => sendCodes(brk), 70);
+  };
+  input.addEventListener("input", async () => {
+    const v = input.value;
+    try {
+      if (v.length >= lastVal.length && v.startsWith(lastVal)) {
+        const added = v.slice(lastVal.length);
+        if (added) await emulator.keyboard_send_text(added);
+      } else {
+        // edited in the middle (or cleared): backspace out the old, type the new
+        const n = lastVal.length;
+        if (n) { sendCodes(new Array(n).fill(0x0E)); await new Promise(r => setTimeout(r, 70)); sendCodes(new Array(n).fill(0x8E)); }
+        if (v) await emulator.keyboard_send_text(v);
+      }
+    } catch (e) {}
+    lastVal = v;
+    if (lastVal.length > 160) { lastVal = ""; input.value = ""; } // keep the field from growing forever
+  });
+  const KEYS = {
+    enter: () => tapKey([0x1C]),
+    tab:   () => tapKey([0x0F]),
+    esc:   () => tapKey([0x01]),
+    up:    () => tapKey([0xE0, 0x48]),
+    down:  () => tapKey([0xE0, 0x50]),
+    left:  () => tapKey([0xE0, 0x4B]),
+    right: () => tapKey([0xE0, 0x4D]),
+    ctrlc: () => { sendCodes([0x1D, 0x2E]); setTimeout(() => sendCodes([0xAE, 0x9D]), 90); },
+  };
+  document.querySelectorAll("#kbdbar button.key").forEach(b => {
+    b.addEventListener("click", (e) => { e.preventDefault(); (KEYS[b.dataset.k] || (() => {}))(); input.focus({ preventScroll: true }); });
+  });
 }
 
 // test hook: ?autoboot=<distro-id>, e.g. ?local=1&autoboot=dsl
