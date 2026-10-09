@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clone</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #0a0a0b; color: #e8e8ea;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    min-height: 100vh; display: flex; flex-direction: column; align-items: center;
+    padding: 28px 16px;
+  }
+  h1 { font-size: 30px; letter-spacing: .4em; text-indent: .4em; margin-bottom: 6px; }
+  .sub { color: #71717a; font-size: 12px; margin-bottom: 22px; }
+  #picker { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; margin-bottom: 16px; }
+  button.distro {
+    background: #18181b; border: 1px solid #3f3f46; color: #e8e8ea;
+    font: inherit; font-size: 14px; padding: 10px 18px; border-radius: 6px; cursor: pointer;
+  }
+  button.distro small { color: #71717a; margin-left: 6px; }
+  button.distro:hover:not(:disabled) { background: #27272a; border-color: #a1a1aa; }
+  button.distro:disabled { opacity: .35; cursor: default; }
+  #status { font-size: 13px; color: #a1a1aa; min-height: 22px; margin-bottom: 8px; text-align: center; }
+  #barwrap { width: min(480px, 90%); height: 3px; background: #27272a; border-radius: 2px; margin-bottom: 14px; }
+  #bar { height: 100%; width: 0%; background: #e8e8ea; border-radius: 2px; transition: width .15s; }
+  #screen { width: min(960px, 100%); }
+  #screen_container {
+    background: #000; border: 1px solid #27272a; border-radius: 8px; overflow: hidden;
+    aspect-ratio: 4 / 3; display: flex; align-items: center; justify-content: center;
+    color: #52525b; font-size: 12px;
+  }
+  #screen_container canvas { width: 100%; height: 100%; display: block; image-rendering: pixelated; }
+  .foot { margin-top: 14px; color: #52525b; font-size: 11px; }
+</style>
+</head>
+<body>
+  <h1>Clone</h1>
+  <div class="sub">ephemeral linux &middot; runs in this tab &middot; dies with it</div>
+  <div id="picker"></div>
+  <div id="status">pick a distro</div>
+  <div id="barwrap"><div id="bar"></div></div>
+  <div id="screen"><div id="screen_container"><span>no machine running</span></div></div>
+  <div class="foot">RAM only &middot; no disk writes &middot; no guest network</div>
+
+<script src="vendor/libv86.js"></script>
+<script>
+"use strict";
+
+// Public mirrors. The page hosts no ISOs.
+// NOTE: most public mirrors (incl. archive.org) do NOT send
+// Access-Control-Allow-Origin, so cross-origin boot is browser-blocked.
+// Same-origin copies under ./isos/ are the working path (see ?local=1).
+// NOTE: v86 is a 32-bit (i686) emulator — all ISOs below MUST be 32-bit.
+// x86_64 images will not boot, period.
+const DISTROS = [
+  { id: "dsl", name: "DSL", size: "50 MB", ram: 512,
+    url: "https://archive.org/download/damn-small-linux-4.4.10/dsl-4.4.10.iso",
+    file: "dsl-4.4.10.iso" },
+  { id: "tinycore", name: "Tiny Core", size: "25 MB", ram: 512,
+    url: "https://archive.org/download/tiny-core-current_202412/TinyCore-current.iso",
+    file: "TinyCore-current.iso" },
+  { id: "alpine", name: "Alpine", size: "222 MB", ram: 1024,
+    url: "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/x86/alpine-standard-3.22.1-x86.iso",
+    file: "alpine-standard-3.22.1-x86.iso" },
+  { id: "slax", name: "Slax", size: "226 MB", ram: 1024,
+    url: "https://archive.org/download/20260924_20260924_1127/slax-English-US-7.0.8-i486.iso",
+    file: "slax-English-US-7.0.8-i486.iso" },
+];
+
+const params = new URLSearchParams(location.search);
+const FORCE_LOCAL = params.has("local"); // dev/test: ./isos/ first
+
+const statusEl = document.getElementById("status");
+const barEl = document.getElementById("bar");
+const pickerEl = document.getElementById("picker");
+const screenEl = document.getElementById("screen_container");
+
+function setStatus(t) { statusEl.textContent = t; }
+function setBar(p) { barEl.style.width = Math.round(p * 100) + "%"; }
+
+for (const d of DISTROS) {
+  const b = document.createElement("button");
+  b.className = "distro";
+  b.innerHTML = d.name + "<small>" + d.size + "</small>";
+  b.onclick = () => boot(d);
+  b.dataset.id = d.id;
+  pickerEl.appendChild(b);
+}
+function lockPicker(lock) {
+  pickerEl.querySelectorAll("button").forEach(b => b.disabled = lock);
+}
+
+async function fetchISO(d, onProgress) {
+  const sources = FORCE_LOCAL ? ["isos/" + d.file, d.url] : [d.url, "isos/" + d.file];
+  let lastErr = null;
+  for (const src of sources) {
+    try {
+      setStatus("fetching " + d.name + " iso…");
+      const res = await fetch(src);
+      if (!res.ok) throw new Error("http " + res.status);
+      const total = parseInt(res.headers.get("content-length") || "0", 10);
+      const reader = res.body.getReader();
+      const chunks = [];
+      let loaded = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        loaded += value.length;
+        if (total) onProgress(loaded / total);
+      }
+      const buf = new Uint8Array(loaded);
+      let off = 0;
+      for (const c of chunks) { buf.set(c, off); off += c.length; }
+      return buf.buffer;
+    } catch (e) {
+      lastErr = e;
+      setStatus("mirror blocked — trying next…");
+    }
+  }
+  throw lastErr || new Error("fetch failed");
+}
+
+async function boot(d) {
+  lockPicker(true);
+  setBar(0);
+  try {
+    const iso = await fetchISO(d, p => {
+      setStatus("fetching " + d.name + " iso… " + Math.round(p * 100) + "%");
+      setBar(p);
+    });
+    setStatus("starting emulator…");
+    setBar(1);
+    screenEl.innerHTML = "";
+    // NOTE: current v86 builds export `V86` (V86Starter was renamed)
+    const emulator = new V86({
+      wasm_path: "vendor/v86.wasm",
+      memory_size: d.ram * 1024 * 1024,
+      vga_memory_size: 8 * 1024 * 1024,
+      screen_container: screenEl,
+      bios: { url: "bios/seabios.bin" },
+      vga_bios: { url: "bios/vgabios.bin" },
+      cdrom: { buffer: iso },
+      autostart: true,
+    });
+    emulator.add_listener("emulator-ready", () => {
+      setStatus(d.name + " running — close the tab to kill it");
+    });
+    window._emulator = emulator; // debug handle
+  } catch (e) {
+    setStatus("boot failed: " + (e && e.message || e));
+    lockPicker(false);
+  }
+}
+
+// test hook: ?autoboot=<distro-id>, e.g. ?local=1&autoboot=dsl
+const auto = params.get("autoboot");
+if (auto) {
+  const d = DISTROS.find(x => x.id === auto);
+  if (d) boot(d);
+}
+</script>
+</body>
+</html>
